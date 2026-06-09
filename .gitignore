@@ -1,0 +1,17 @@
+/.cursor
+/debug_ui.log
+/selections.json
+/settings.json
+
+/tools
+
+
+
+# all __pycache__ directories
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+/output
