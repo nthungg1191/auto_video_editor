@@ -64,8 +64,10 @@ def detect_system_info() -> dict:
     """
     Returns dict with keys:
       - cpu_name       (str)
+      - cpu_load_pct   (int)   -- live system-wide CPU usage 0-100
       - ram_total_gb   (float)
       - ram_free_gb    (float)
+      - ram_used_pct   (int)   -- live RAM usage 0-100
       - gpu_name       (str)
       - gpu_available  (bool)
       - vram_total_mb  (int)
@@ -74,8 +76,10 @@ def detect_system_info() -> dict:
     """
     info = {
         "cpu_name": "—",
+        "cpu_load_pct": 0,
         "ram_total_gb": 0,
         "ram_free_gb": 0,
+        "ram_used_pct": 0,
         "gpu_name": "Khong co GPU",
         "gpu_available": False,
         "vram_total_mb": 0,
@@ -96,6 +100,19 @@ def detect_system_info() -> dict:
     except Exception:
         pass
 
+    # CPU load % via wmic
+    try:
+        r = subprocess.run(
+            ["wmic", "cpu", "get", "loadpercentage"],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=5
+        )
+        if r.returncode == 0:
+            lines = [l.strip() for l in r.stdout.strip().splitlines() if l.strip() and l.strip().isdigit()]
+            if lines:
+                info["cpu_load_pct"] = int(lines[-1])
+    except Exception:
+        pass
+
     # RAM via wmic OS
     try:
         r = subprocess.run(
@@ -103,13 +120,19 @@ def detect_system_info() -> dict:
             capture_output=True, encoding="utf-8", errors="replace", timeout=5
         )
         if r.returncode == 0:
+            total_kb = 0
+            free_kb = 0
             for line in r.stdout.splitlines():
                 if "TotalVisibleMemorySize" in line:
                     val = line.split("=")[-1].strip()
-                    info["ram_total_gb"] = round(int(val) / (1024 ** 2), 1)
+                    total_kb = int(val)
+                    info["ram_total_gb"] = round(total_kb / (1024 ** 2), 1)
                 elif "FreePhysicalMemory" in line:
                     val = line.split("=")[-1].strip()
-                    info["ram_free_gb"] = round(int(val) / (1024 ** 2), 1)
+                    free_kb = int(val)
+                    info["ram_free_gb"] = round(free_kb / (1024 ** 2), 1)
+            if total_kb > 0:
+                info["ram_used_pct"] = int(round((1 - free_kb / total_kb) * 100))
     except Exception:
         pass
 

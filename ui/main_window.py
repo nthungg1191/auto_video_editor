@@ -371,23 +371,24 @@ class MainWindow(QMainWindow):
         lay.addWidget(title_lbl)
         lay.addSpacing(16)
         
-        # CPU badge
-        self._cpu_lbl = QLabel(f"CPU: {si['cpu_name']}")
-        self._cpu_lbl.setStyleSheet(
-            "color: #93c5fd; font-size: 11px; "
-            "background: #1e293b; border-radius: 4px; padding: 3px 8px; "
-            "border: 1px solid #334155;"
+        # CPU load badge
+        self._cpu_load_lbl = QLabel(f"CPU: {si['cpu_load_pct']}%")
+        self._cpu_load_lbl.setStyleSheet(
+            "color: #fde68a; font-size: 11px; "
+            "background: #2e2500; border-radius: 4px; padding: 3px 8px; "
+            "border: 1px solid #78350f;"
         )
-        lay.addWidget(self._cpu_lbl)
+        lay.addWidget(self._cpu_load_lbl)
 
-        # RAM badge
-        self._ram_lbl = QLabel(f"RAM: {si['ram_free_gb']:.1f}/{si['ram_total_gb']:.1f} GB")
-        self._ram_lbl.setStyleSheet(
-            "color: #86efac; font-size: 11px; "
-            "background: #1a2e1a; border-radius: 4px; padding: 3px 8px; "
-            "border: 1px solid #22543d;"
+
+        # RAM usage badge
+        self._ram_pct_lbl = QLabel(f"RAM: {si['ram_used_pct']}%")
+        self._ram_pct_lbl.setStyleSheet(
+            "color: #fca5a5; font-size: 11px; "
+            "background: #2e1a1a; border-radius: 4px; padding: 3px 8px; "
+            "border: 1px solid #742a2a;"
         )
-        lay.addWidget(self._ram_lbl)
+        lay.addWidget(self._ram_pct_lbl)
 
         # GPU badge
         gpu_ok = si["gpu_available"]
@@ -429,9 +430,11 @@ class MainWindow(QMainWindow):
         """Refresh system-info badges in the title bar."""
         si = detect_system_info()
 
-        # CPU — name doesn't change, skip
-        # RAM
-        self._ram_lbl.setText(f"RAM: {si['ram_free_gb']:.1f}/{si['ram_total_gb']:.1f} GB")
+        # CPU load
+        self._cpu_load_lbl.setText(f"Load: {si['cpu_load_pct']}%")
+
+        # RAM usage
+        self._ram_pct_lbl.setText(f"Used: {si['ram_used_pct']}%")
 
         # VRAM
         if si["gpu_available"]:
