@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QSlider, QMessageBox, QStatusBar,
     QFrame, QGridLayout, QAbstractItemView, QTabWidget
 )
-from PyQt6.QtCore import Qt, QSize, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, pyqtSignal, QRunnable, QThreadPool, QObject
 from PyQt6.QtGui import QColor, QFont, QIcon, QImage
 
 from core.video_processor import RenderConfig, SubtitleStyle, FilePair, build_pairs, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS
@@ -36,6 +36,8 @@ from core.srt_service import SrtService
 from core.style_preset_service import StylePresetService
 from core.subtitle_model import SubtitleEntry
 from ui.subtitle_preview_widget import SubtitlePreviewWidget, SubtitleStyleEditor, LiveFramePreview
+from ui.video_layer_config import VideoLayerConfigWidget
+from ui.video_layout_preview import VideoLayoutPreview
 from utils import settings as cfg
 from utils.gpu_detect import detect_gpu, detect_system_info, check_ffmpeg, check_ffprobe
 
@@ -352,7 +354,7 @@ class PairTable(QTableWidget):
         for pair in pairs:
             row = self.rowCount()
             self.insertRow(row)
-            self.setItem(row, 0, self._cell(pair.index, center=True))
+            self.setItem(row, 0, self._cell(pair.index, center=True, checkable=pair.matched))
             self.setItem(row, 1, self._cell(Path(pair.audio_path).name if pair.audio_path else "—"))
             self.setItem(row, 2, self._cell(Path(pair.srt_path).name if pair.srt_path else "—"))
             status_text = "✓ Khớp" if pair.matched else f"✗ {pair.error}"
@@ -364,10 +366,13 @@ class PairTable(QTableWidget):
             self.setItem(row, 3, status_item)
 
     @staticmethod
-    def _cell(text: str, center: bool = False) -> QTableWidgetItem:
+    def _cell(text: str, center: bool = False, checkable: bool = False) -> QTableWidgetItem:
         item = QTableWidgetItem(text)
         if center:
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        if checkable:
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
         return item
 
 
@@ -424,6 +429,21 @@ def _extract_video_frame(video_path: str, timestamp: str | None = None) -> QImag
         return None
 
 
+class FrameExtractSignals(QObject):
+    loaded = pyqtSignal(str, QImage)  # path, image
+
+class FrameExtractTask(QRunnable):
+    def __init__(self, video_path: str):
+        super().__init__()
+        self.video_path = video_path
+        self.signals = FrameExtractSignals()
+
+    def run(self):
+        img = _extract_video_frame(self.video_path)
+        if img and not img.isNull():
+            self.signals.loaded.emit(self.video_path, img)
+
+
 class MainWindow(QMainWindow):
 
     def __init__(self):
@@ -440,6 +460,9 @@ class MainWindow(QMainWindow):
         self._active_preset: SubtitleStylePreset | None = None
         self._timing_undo: dict[str, list[SubtitleEntry]] = {}  # path → original entries
         self.logo_layers: list[ImageLayerControl] = []
+        self.frame_pool = QThreadPool()
+        self.frame_pool.setMaxThreadCount(2)
+        self.running_extractions = set()
 
         self._build_ui()
         self._apply_saved_settings()
@@ -496,6 +519,38 @@ class MainWindow(QMainWindow):
         # --- Title bar ---
         title_bar = self._make_title_bar()
         root_lay.addWidget(title_bar)
+
+        # --- Main Mode Tab Selector Bar ---
+        mode_bar = QWidget()
+        mode_bar.setFixedHeight(36)
+        mode_bar.setStyleSheet("background: #e2e8f0; border-bottom: 1px solid #cbd5e1;")
+        mode_lay = QHBoxLayout(mode_bar)
+        mode_lay.setContentsMargins(0, 0, 0, 0)
+        mode_lay.setSpacing(0)
+
+        self.btn_tab_sub = QPushButton("✍️ Edit Sub (Biên tập phụ đề)")
+        self.btn_tab_sub.setCheckable(True)
+        self.btn_tab_sub.setChecked(True)
+        self.btn_tab_sub.setFixedHeight(36)
+        self.btn_tab_sub.setStyleSheet(
+            "QPushButton { background: #ffffff; color: #2563eb; font-weight: bold; border: none; border-bottom: 2px solid #2563eb; font-size: 12px; }"
+            "QPushButton:hover { background: #f8fafc; }"
+        )
+        self.btn_tab_sub.clicked.connect(self._on_mode_sub_clicked)
+
+        self.btn_tab_video = QPushButton("🎬 Edit Video (Biên tập Video)")
+        self.btn_tab_video.setCheckable(True)
+        self.btn_tab_video.setChecked(False)
+        self.btn_tab_video.setFixedHeight(36)
+        self.btn_tab_video.setStyleSheet(
+            "QPushButton { background: #f1f5f9; color: #475569; font-weight: bold; border: none; font-size: 12px; }"
+            "QPushButton:hover { background: #e2e8f0; }"
+        )
+        self.btn_tab_video.clicked.connect(self._on_mode_video_clicked)
+
+        mode_lay.addWidget(self.btn_tab_sub, 1)
+        mode_lay.addWidget(self.btn_tab_video, 1)
+        root_lay.addWidget(mode_bar)
 
         # --- 3-panel horizontal splitter ---
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -623,11 +678,17 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         panel.setStyleSheet("background: #fafafa;")
         lay = QVBoxLayout(panel)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(10)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        # 1. Edit Sub Container
+        self.left_sub_container = QWidget()
+        sub_lay = QVBoxLayout(self.left_sub_container)
+        sub_lay.setContentsMargins(12, 12, 12, 12)
+        sub_lay.setSpacing(10)
 
         # Folder pickers group
-        grp_folders = QGroupBox("📁  Thư mục")
+        grp_folders = QGroupBox("📁  Thư mục (Biên tập phụ đề)")
         grp_folders.setStyleSheet("QGroupBox { font-size: 13px; font-weight: 600; }")
         f_lay = QVBoxLayout(grp_folders)
         f_lay.setSpacing(6)
@@ -671,7 +732,7 @@ class MainWindow(QMainWindow):
         pair_hint.setStyleSheet("font-size: 11px; color: #6b7280;")
         f_lay.addWidget(pair_hint)
 
-        lay.addWidget(grp_folders)
+        sub_lay.addWidget(grp_folders)
 
         # File pairs table
         grp_pairs = QGroupBox("📋  Danh sách file (audio ↔ SRT)")
@@ -679,13 +740,108 @@ class MainWindow(QMainWindow):
         p_lay = QVBoxLayout(grp_pairs)
         self.pair_table = PairTable()
         self.pair_table.itemSelectionChanged.connect(self._on_pair_selection_changed)
+        self.pair_table.itemChanged.connect(self._on_table_item_changed)
         p_lay.addWidget(self.pair_table)
 
+        pair_btn_lay = QHBoxLayout()
+        self.btn_pair_select_all = QPushButton("Chọn tất cả")
+        self.btn_pair_select_all.setStyleSheet("font-size: 10px; padding: 2px 8px;")
+        self.btn_pair_select_all.clicked.connect(self._pair_select_all)
+        self.btn_pair_deselect_all = QPushButton("Bỏ chọn tất cả")
+        self.btn_pair_deselect_all.setStyleSheet("font-size: 10px; padding: 2px 8px;")
+        self.btn_pair_deselect_all.clicked.connect(self._pair_deselect_all)
+        pair_btn_lay.addWidget(self.btn_pair_select_all)
+        pair_btn_lay.addWidget(self.btn_pair_deselect_all)
+        pair_btn_lay.addStretch(1)
+        
         self.lbl_pair_summary = QLabel("Chưa quét")
         self.lbl_pair_summary.setStyleSheet("font-size: 11px; color: #6b7280;")
-        p_lay.addWidget(self.lbl_pair_summary)
+        pair_btn_lay.addWidget(self.lbl_pair_summary)
+        p_lay.addLayout(pair_btn_lay)
 
-        lay.addWidget(grp_pairs, 1)
+        sub_lay.addWidget(grp_pairs, 1)
+        lay.addWidget(self.left_sub_container)
+
+        # 2. Edit Video Container
+        self.left_video_container = QWidget()
+        vid_lay = QVBoxLayout(self.left_video_container)
+        vid_lay.setContentsMargins(12, 12, 12, 12)
+        vid_lay.setSpacing(10)
+
+        # Video pickers group
+        grp_vid_folders = QGroupBox("📁  Thư mục (Biên tập video)")
+        grp_vid_folders.setStyleSheet("QGroupBox { font-size: 13px; font-weight: 600; }")
+        fv_lay = QVBoxLayout(grp_vid_folders)
+        fv_lay.setSpacing(6)
+
+        self.pick_vid_src = FolderPicker("Video nguồn:", "Chọn thư mục video nguồn")
+        self.pick_vid_bg = FolderPicker("Video nền:", "Chọn file video nền (tùy chọn)")
+        self.pick_vid_output = FolderPicker("Output:", "Chọn thư mục xuất video")
+
+        self.pick_vid_bg.set_mode("files")
+        self.pick_vid_bg.set_file_dialog(
+            "Chọn file video nền",
+            "Video files (*.mp4 *.mkv *.mov *.avi *.webm *.m4v);;All files (*.*)"
+        )
+        self.pick_vid_bg.btn.setText("Chọn file…")
+        
+        self.pick_vid_src.set_callback(self._on_video_selection_change)
+        self.pick_vid_bg.set_callback(self._on_video_selection_change)
+
+        for w in [self.pick_vid_src, self.pick_vid_bg, self.pick_vid_output]:
+            fv_lay.addWidget(w)
+
+        self.btn_vid_refresh = QPushButton("🔄  Quét lại thư mục")
+        self.btn_vid_refresh.clicked.connect(self._scan_video_batch)
+        self.btn_vid_refresh.setStyleSheet("font-size: 12px;")
+        fv_lay.addWidget(self.btn_vid_refresh)
+
+        vid_lay.addWidget(grp_vid_folders)
+
+        # Video Batch Table
+        grp_vids = QGroupBox("📋  Danh sách Video cần Scale hàng loạt")
+        grp_vids.setStyleSheet("QGroupBox { font-size: 13px; font-weight: 600; }")
+        pv_lay = QVBoxLayout(grp_vids)
+        
+        self.vid_batch_table = QTableWidget(0, 4)
+        self.vid_batch_table.setHorizontalHeaderLabels(["#", "Tên video nguồn", "Độ phân giải", "Trạng thái"])
+        self.vid_batch_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.vid_batch_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.vid_batch_table.setAlternatingRowColors(True)
+        self.vid_batch_table.verticalHeader().setVisible(False)
+        hdr = self.vid_batch_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.vid_batch_table.setColumnWidth(0, 40)
+        self.vid_batch_table.setColumnWidth(3, 100)
+        self.vid_batch_table.setStyleSheet("font-size: 12px;")
+        self.vid_batch_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.vid_batch_table.itemSelectionChanged.connect(self._on_video_batch_selection_changed)
+        self.vid_batch_table.itemChanged.connect(self._on_table_item_changed)
+        pv_lay.addWidget(self.vid_batch_table)
+
+        vid_btn_lay = QHBoxLayout()
+        self.btn_vid_select_all = QPushButton("Chọn tất cả")
+        self.btn_vid_select_all.setStyleSheet("font-size: 10px; padding: 2px 8px;")
+        self.btn_vid_select_all.clicked.connect(self._vid_select_all)
+        self.btn_vid_deselect_all = QPushButton("Bỏ chọn tất cả")
+        self.btn_vid_deselect_all.setStyleSheet("font-size: 10px; padding: 2px 8px;")
+        self.btn_vid_deselect_all.clicked.connect(self._vid_deselect_all)
+        vid_btn_lay.addWidget(self.btn_vid_select_all)
+        vid_btn_lay.addWidget(self.btn_vid_deselect_all)
+        vid_btn_lay.addStretch(1)
+
+        self.lbl_vid_summary = QLabel("Chưa quét")
+        self.lbl_vid_summary.setStyleSheet("font-size: 11px; color: #6b7280;")
+        vid_btn_lay.addWidget(self.lbl_vid_summary)
+        pv_lay.addLayout(vid_btn_lay)
+
+        vid_lay.addWidget(grp_vids, 1)
+        lay.addWidget(self.left_video_container)
+        self.left_video_container.setVisible(False)
+
         return panel
 
     # ---- Middle panel — Subtitle Style + Preview ----
@@ -694,10 +850,15 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         panel.setStyleSheet("background: #fafafa;")
         lay = QVBoxLayout(panel)
-        lay.setContentsMargins(10, 10, 10, 10)
-        lay.setSpacing(10)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
 
-        # --- Tab Widget for Subtitle Style & Image Layers ---
+        # 1. Edit Sub Container
+        self.middle_sub_container = QWidget()
+        sub_lay = QVBoxLayout(self.middle_sub_container)
+        sub_lay.setContentsMargins(10, 10, 10, 10)
+        sub_lay.setSpacing(10)
+
         self.main_tab_widget = QTabWidget()
         self.main_tab_widget.setStyleSheet(
             "QTabWidget::pane { border: 1px solid #cbd5e1; border-radius: 4px; background: white; }"
@@ -783,9 +944,9 @@ class MainWindow(QMainWindow):
 
         tab_layers_lay.addWidget(self.layer_tab_widget)
         self.main_tab_widget.addTab(tab_layers, "🖼️ Image Layers")
-        lay.addWidget(self.main_tab_widget)
+        sub_lay.addWidget(self.main_tab_widget)
 
-        # --- Preview ---
+        # Preview Group
         grp_preview = QGroupBox("🖼  Preview")
         grp_preview.setStyleSheet("QGroupBox { font-size: 13px; font-weight: 600; }")
         preview_lay = QVBoxLayout(grp_preview)
@@ -811,10 +972,70 @@ class MainWindow(QMainWindow):
         preview_ctrl.addWidget(self.btn_refresh_frame)
         preview_lay.addLayout(preview_ctrl)
 
-        lay.addWidget(grp_preview, 1)
-
+        sub_lay.addWidget(grp_preview, 1)
         self.style_panel.hide_preset_bar()
         self.preview_widget.set_style(self.style_panel.get_style())
+        lay.addWidget(self.middle_sub_container)
+
+        # 2. Edit Video Container
+        self.middle_video_container = QWidget()
+        vid_lay = QVBoxLayout(self.middle_video_container)
+        vid_lay.setContentsMargins(10, 10, 10, 10)
+        vid_lay.setSpacing(10)
+
+        # Tab Widget for 5 Video Layers
+        self.video_tab_widget = QTabWidget()
+        self.video_tab_widget.setStyleSheet(
+            "QTabWidget::pane { border: 1px solid #cbd5e1; border-radius: 4px; background: white; }"
+            "QTabBar::tab { font-size: 11px; font-weight: 600; padding: 6px 16px; background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; border-bottom: none; border-top-left-radius: 4px; border-top-right-radius: 4px; min-width: 100px; }"
+            "QTabBar::tab:selected { background: white; color: #2563eb; border-bottom: 2px solid #2563eb; }"
+        )
+
+        self.video_layer_widgets = []
+        for i in range(1, 6):
+            widget = VideoLayerConfigWidget(i)
+            widget.changed.connect(self._on_video_layer_changed)
+            self.video_layer_widgets.append(widget)
+            self.video_tab_widget.addTab(widget, f"Video Layer {i}")
+
+        vid_lay.addWidget(self.video_tab_widget)
+
+        # Video Layout Preview Box
+        grp_vid_preview = QGroupBox("🖼  Preview (Kéo/Thả/Scale & Cắt khung trực tiếp)")
+        grp_vid_preview.setStyleSheet("QGroupBox { font-size: 13px; font-weight: 600; }")
+        vid_preview_lay = QVBoxLayout(grp_vid_preview)
+        vid_preview_lay.setSpacing(6)
+
+        self.video_layout_preview = VideoLayoutPreview()
+        self.video_layout_preview.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self.video_layout_preview.layerSelected.connect(self._on_preview_layer_selected)
+        self.video_layout_preview.layerMoved.connect(self._on_preview_layer_moved)
+        self.video_layout_preview.layerResized.connect(self._on_preview_layer_resized)
+        self.video_layout_preview.layerCropped.connect(self._on_preview_layer_cropped)
+        vid_preview_lay.addWidget(self.video_layout_preview)
+
+        # Video Preview controls
+        vid_preview_ctrl = QHBoxLayout()
+        vid_preview_ctrl.setSpacing(6)
+        vid_preview_ctrl.addStretch()
+        
+        self.btn_vid_crop_mode = QPushButton("✂  Bật Crop Mode")
+        self.btn_vid_crop_mode.setCheckable(True)
+        self.btn_vid_crop_mode.setStyleSheet(
+            "QPushButton { background: #1e293b; color: #f59e0b; border: 1px solid #f59e0b; "
+            "padding: 4px 12px; border-radius: 4px; font-size: 11px; font-weight: bold; }"
+            "QPushButton:checked { background: #f59e0b; color: #000000; }"
+        )
+        self.btn_vid_crop_mode.clicked.connect(self._toggle_video_crop_mode)
+        vid_preview_ctrl.addWidget(self.btn_vid_crop_mode)
+        vid_preview_lay.addLayout(vid_preview_ctrl)
+
+        vid_lay.addWidget(grp_vid_preview, 1)
+        lay.addWidget(self.middle_video_container)
+        self.middle_video_container.setVisible(False)
+
         return panel
 
     def _on_style_changed(self, style: SubtitleStylePreset):
@@ -1117,6 +1338,11 @@ class MainWindow(QMainWindow):
             self.pick_bg.set_value(s.get("bg_folder", ""))
         self.pick_output.set_value(s.get("output_folder", ""))
 
+        # Restore Edit Video Folder paths
+        self.pick_vid_src.set_value(s.get("vid_src_folder", ""))
+        self.pick_vid_bg.set_value(s.get("vid_bg_folder", ""))
+        self.pick_vid_output.set_value(s.get("vid_output_folder", ""))
+
         hardcoded_media_files = self._resolve_hardcoded_media_files()
         if hardcoded_media_files:
             self.pick_audio.set_selected_files(hardcoded_media_files)
@@ -1191,6 +1417,33 @@ class MainWindow(QMainWindow):
             
         self._on_logo_settings_changed()
 
+        # Restore Edit Video layers (5 layers)
+        for idx, widget in enumerate(self.video_layer_widgets):
+            layer_num = idx + 1
+            widget.chk_enabled.setChecked(s.get(f"vlayer_enabled_{layer_num}", layer_num in (1, 2, 3)))
+            
+            src_type = s.get(f"vlayer_source_type_{layer_num}", 0 if layer_num == 1 else 1 if layer_num == 2 else 2)
+            widget.cmb_source_type.setCurrentIndex(src_type)
+            
+            path_val = s.get(f"vlayer_path_{layer_num}", "logo.png" if layer_num == 3 else "")
+            widget.edit_path.setText(path_val)
+            
+            widget.cmb_pos.setCurrentIndex(s.get(f"vlayer_position_{layer_num}", 0 if layer_num in (1, 2) else 1)) # Combo 0 is Center, 1 is BR
+            widget.spn_size.setValue(s.get(f"vlayer_size_{layer_num}", 100 if layer_num == 1 else 40 if layer_num == 2 else 15))
+            widget.spn_opacity.setValue(s.get(f"vlayer_opacity_{layer_num}", 90 if layer_num == 1 else 100))
+            
+            widget.spn_margin_t.setValue(s.get(f"vlayer_margin_t_{layer_num}", 0 if layer_num == 1 else 20))
+            widget.spn_margin_b.setValue(s.get(f"vlayer_margin_b_{layer_num}", 0 if layer_num == 1 else 20))
+            widget.spn_margin_l.setValue(s.get(f"vlayer_margin_l_{layer_num}", 0 if layer_num == 1 else 20))
+            widget.spn_margin_r.setValue(s.get(f"vlayer_margin_r_{layer_num}", 0 if layer_num == 1 else 20))
+            
+            widget.spn_crop_t.setValue(s.get(f"vlayer_crop_t_{layer_num}", 0))
+            widget.spn_crop_b.setValue(s.get(f"vlayer_crop_b_{layer_num}", 0))
+            widget.spn_crop_l.setValue(s.get(f"vlayer_crop_l_{layer_num}", 0))
+            widget.spn_crop_r.setValue(s.get(f"vlayer_crop_r_{layer_num}", 0))
+
+        self._on_video_layer_changed()
+
         # Auto-scan if files already set
         if self.pick_audio.selected_files() and self.pick_srt.selected_files():
             self._scan_pairs()
@@ -1237,6 +1490,9 @@ class MainWindow(QMainWindow):
             "audio_files": self.pick_audio.selected_files(),
             "srt_files": self.pick_srt.selected_files(),
             "output_folder": self.pick_output.value(),
+            "vid_src_folder": self.pick_vid_src.value(),
+            "vid_bg_folder": self.pick_vid_bg.value(),
+            "vid_output_folder": self.pick_vid_output.value(),
             "font_name": style.font_name,
             "font_size": style.font_size,
             "font_color": style.font_color,
@@ -1279,6 +1535,25 @@ class MainWindow(QMainWindow):
             settings_dict[f"logo_margin_b_{layer_num}"] = cfg_obj.margin_b
             settings_dict[f"logo_margin_l_{layer_num}"] = cfg_obj.margin_l
             settings_dict[f"logo_margin_r_{layer_num}"] = cfg_obj.margin_r
+
+        # Save Edit Video layers (5 layers)
+        for idx, widget in enumerate(self.video_layer_widgets):
+            layer_num = idx + 1
+            cfg_obj = widget.get_config()
+            settings_dict[f"vlayer_enabled_{layer_num}"] = cfg_obj.enabled
+            settings_dict[f"vlayer_source_type_{layer_num}"] = widget.cmb_source_type.currentIndex()
+            settings_dict[f"vlayer_path_{layer_num}"] = widget.edit_path.text()
+            settings_dict[f"vlayer_position_{layer_num}"] = widget.cmb_pos.currentIndex()
+            settings_dict[f"vlayer_size_{layer_num}"] = cfg_obj.size
+            settings_dict[f"vlayer_opacity_{layer_num}"] = int(cfg_obj.opacity * 100)
+            settings_dict[f"vlayer_margin_t_{layer_num}"] = cfg_obj.margin_t
+            settings_dict[f"vlayer_margin_b_{layer_num}"] = cfg_obj.margin_b
+            settings_dict[f"vlayer_margin_l_{layer_num}"] = cfg_obj.margin_l
+            settings_dict[f"vlayer_margin_r_{layer_num}"] = cfg_obj.margin_r
+            settings_dict[f"vlayer_crop_t_{layer_num}"] = cfg_obj.crop_t
+            settings_dict[f"vlayer_crop_b_{layer_num}"] = cfg_obj.crop_b
+            settings_dict[f"vlayer_crop_l_{layer_num}"] = cfg_obj.crop_l
+            settings_dict[f"vlayer_crop_r_{layer_num}"] = cfg_obj.crop_r
 
         # Legacy fallback
         if self.logo_layers:
@@ -1507,48 +1782,81 @@ class MainWindow(QMainWindow):
 
     def _build_config(self) -> RenderConfig:
         codec_val = CODECS[self.cmb_codec.currentIndex()][1]
-        preset = self.style_panel.get_style()
-        style = SubtitleStyle.from_preset(preset)
         
-        configs = []
-        for ctrl in self.logo_layers:
-            configs.append(ctrl.get_config())
+        if self.btn_tab_video.isChecked():
+            # Edit Video mode configurations
+            configs = []
+            for ctrl in self.video_layer_widgets:
+                configs.append(ctrl.get_config())
+                
+            return RenderConfig(
+                bg_folder="",
+                bg_videos=self.pick_vid_bg.selected_files(),
+                audio_folder="",
+                srt_folder="",
+                output_folder=self.pick_vid_output.value(),
+                subtitle_style=SubtitleStyle(font_size=0, stroke_enabled=False, bg_enabled=False),
+                slow_min=self.spn_slow_min.value(),
+                slow_max=self.spn_slow_max.value(),
+                codec=codec_val,
+                use_gpu="nvenc" in codec_val,
+                logo_path=None,
+                layers=configs
+            )
+        else:
+            preset = self.style_panel.get_style()
+            style = SubtitleStyle.from_preset(preset)
             
-        layer1 = configs[0] if configs else None
-        
-        return RenderConfig(
-            bg_folder=self.pick_bg.value(),
-            bg_videos=self.pick_bg.selected_files(),
-            audio_folder=self.pick_audio.value(),
-            srt_folder=self.pick_srt.value(),
-            output_folder=self.pick_output.value(),
-            subtitle_style=style,
-            slow_min=self.spn_slow_min.value(),
-            slow_max=self.spn_slow_max.value(),
-            codec=codec_val,
-            use_gpu="nvenc" in codec_val,
-            logo_path=layer1.path if (layer1 and layer1.enabled) else None,
-            logo_position=layer1.position if layer1 else 0,
-            logo_size=layer1.size if layer1 else 100,
-            logo_opacity=layer1.opacity if layer1 else 0.8,
-            layers=configs
-        )
+            configs = []
+            for ctrl in self.logo_layers:
+                configs.append(ctrl.get_config())
+                
+            layer1 = configs[0] if configs else None
+            
+            return RenderConfig(
+                bg_folder=self.pick_bg.value(),
+                bg_videos=self.pick_bg.selected_files(),
+                audio_folder=self.pick_audio.value(),
+                srt_folder=self.pick_srt.value(),
+                output_folder=self.pick_output.value(),
+                subtitle_style=style,
+                slow_min=self.spn_slow_min.value(),
+                slow_max=self.spn_slow_max.value(),
+                codec=codec_val,
+                use_gpu="nvenc" in codec_val,
+                logo_path=layer1.path if (layer1 and layer1.enabled) else None,
+                logo_position=layer1.position if layer1 else 0,
+                logo_size=layer1.size if layer1 else 100,
+                logo_opacity=layer1.opacity if layer1 else 0.8,
+                layers=configs
+            )
 
     def _validate(self) -> bool:
         errs = []
-        if not self.pick_bg.selected_files():
-            errs.append("• Chưa chọn file Video nền")
-        if not self.pick_audio.selected_files():
-            errs.append("• Chưa chọn file media nguồn")
-        if not self.pick_srt.selected_files():
-            errs.append("• Chưa chọn file Subtitle SRT")
-        if not self.pick_output.value():
-            errs.append("• Chưa chọn thư mục Output")
-        if not self._pairs:
-            errs.append("• Chưa có file nào được ghép (hãy quét lại)")
-        matched = [p for p in self._pairs if p.matched]
-        if not matched:
-            errs.append("• Không có cặp file audio+SRT hợp lệ nào")
+        if self.btn_tab_video.isChecked():
+            # Validate Edit Video mode
+            if not self.pick_vid_src.value():
+                errs.append("• Chưa chọn thư mục video nguồn để scale")
+            if not self.pick_vid_output.value():
+                errs.append("• Chưa chọn thư mục Output")
+            if not self._pairs:
+                errs.append("• Chưa có video nào trong danh sách (hãy quét lại)")
+        else:
+            # Validate Edit Sub mode
+            if not self.pick_bg.selected_files():
+                errs.append("• Chưa chọn file Video nền")
+            if not self.pick_audio.selected_files():
+                errs.append("• Chưa chọn file media nguồn")
+            if not self.pick_srt.selected_files():
+                errs.append("• Chưa chọn file Subtitle SRT")
+            if not self.pick_output.value():
+                errs.append("• Chưa chọn thư mục Output")
+            if not self._pairs:
+                errs.append("• Chưa có file nào được ghép (hãy quét lại)")
+            matched = [p for p in self._pairs if p.matched]
+            if not matched:
+                errs.append("• Không có cặp file audio+SRT hợp lệ nào")
+                
         if errs:
             QMessageBox.warning(self, "Chưa đủ thông tin", "\n".join(errs))
             return False
@@ -1562,7 +1870,20 @@ class MainWindow(QMainWindow):
 
         config = self._build_config()
         os.makedirs(config.output_folder, exist_ok=True)
-        matched_pairs = [p for p in self._pairs if p.matched]
+        # Filter matching pairs based on active tab and checked rows
+        matched_pairs = []
+        table = self.vid_batch_table if self.btn_tab_video.isChecked() else self.pair_table
+        for row in range(table.rowCount()):
+            item = table.item(row, 0)
+            if item and item.checkState() == Qt.CheckState.Checked:
+                if row < len(self._pairs):
+                    p = self._pairs[row]
+                    if p.matched:
+                        matched_pairs.append(p)
+
+        if not matched_pairs:
+            QMessageBox.warning(self, "Cảnh báo", "Bạn chưa chọn bất kỳ video nào để render!")
+            return
 
         self._worker = RenderWorker(matched_pairs, config, self)
         self._worker.progress.connect(self._on_progress)
@@ -1764,8 +2085,301 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Undo", msg)
         self._log(f"[Timing] Undo: {restored} file khôi phục")
 
+    # ------------------------------------------------------------------
+    # Edit Video Interactive Event Slots
+    # ------------------------------------------------------------------
+
+    def _on_mode_sub_clicked(self):
+        self.btn_tab_sub.setChecked(True)
+        self.btn_tab_sub.setStyleSheet(
+            "QPushButton { background: #ffffff; color: #2563eb; font-weight: bold; border: none; border-bottom: 2px solid #2563eb; font-size: 12px; }"
+        )
+        self.btn_tab_video.setChecked(False)
+        self.btn_tab_video.setStyleSheet(
+            "QPushButton { background: #f1f5f9; color: #475569; font-weight: bold; border: none; font-size: 12px; }"
+        )
+        
+        self.left_sub_container.setVisible(True)
+        self.left_video_container.setVisible(False)
+        self.middle_sub_container.setVisible(True)
+        self.middle_video_container.setVisible(False)
+        
+        self._scan_pairs()
+
+    def _on_mode_video_clicked(self):
+        self.btn_tab_sub.setChecked(False)
+        self.btn_tab_sub.setStyleSheet(
+            "QPushButton { background: #f1f5f9; color: #475569; font-weight: bold; border: none; font-size: 12px; }"
+        )
+        self.btn_tab_video.setChecked(True)
+        self.btn_tab_video.setStyleSheet(
+            "QPushButton { background: #ffffff; color: #2563eb; font-weight: bold; border: none; border-bottom: 2px solid #2563eb; font-size: 12px; }"
+        )
+        
+        self.left_sub_container.setVisible(False)
+        self.left_video_container.setVisible(True)
+        self.middle_sub_container.setVisible(False)
+        self.middle_video_container.setVisible(True)
+        
+        self._on_video_layer_changed()
+        self._scan_video_batch()
+
+    def _on_video_selection_change(self, _val):
+        self._scan_video_batch()
+
+    def _scan_video_batch(self):
+        src_files = self.pick_vid_src.selected_files()
+        if not src_files and self.pick_vid_src.value():
+            folder_path = self.pick_vid_src.value()
+            if os.path.isdir(folder_path):
+                import glob
+                extensions = ["*.mp4", "*.mkv", "*.mov", "*.avi", "*.webm", "*.m4v"]
+                src_files = []
+                for ext in extensions:
+                    src_files.extend(glob.glob(os.path.join(folder_path, ext)))
+                    src_files.extend(glob.glob(os.path.join(folder_path, ext.upper())))
+                src_files = sorted(list(set(src_files)))
+
+        self._pairs = []
+        self.vid_batch_table.setRowCount(0)
+        
+        if not src_files:
+            self.lbl_vid_summary.setText("Tìm thấy 0 video")
+            return
+
+        for idx, file_path in enumerate(src_files):
+            row = self.vid_batch_table.rowCount()
+            self.vid_batch_table.insertRow(row)
+            
+            item_idx = QTableWidgetItem(str(idx + 1))
+            item_idx.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            item_idx.setFlags(item_idx.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item_idx.setCheckState(Qt.CheckState.Checked)
+            self.vid_batch_table.setItem(row, 0, item_idx)
+            
+            self.vid_batch_table.setItem(row, 1, QTableWidgetItem(os.path.basename(file_path)))
+            self.vid_batch_table.setItem(row, 2, QTableWidgetItem("1280x720 (16:9)"))
+            
+            item_status = QTableWidgetItem("Sẵn sàng")
+            item_status.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            item_status.setForeground(QColor("#2563eb"))
+            self.vid_batch_table.setItem(row, 3, item_status)
+
+            self._pairs.append(FilePair(
+                index=str(idx + 1),
+                audio_path=file_path,
+                srt_path="",
+                matched=True
+            ))
+
+        self.lbl_vid_summary.setText(f"Tìm thấy {len(src_files)} video — {len(src_files)} sẵn sàng")
+        if src_files:
+            self.vid_batch_table.selectRow(0)
+
+    def _on_video_batch_selection_changed(self):
+        self._update_video_preview_frames()
+
+    def _on_video_layer_changed(self):
+        """Build layer configs and pass them to VideoLayoutPreview."""
+        if not hasattr(self, "video_layout_preview") or not hasattr(self, "video_layer_widgets"):
+            return
+        
+        configs = {}
+        for idx, widget in enumerate(self.video_layer_widgets):
+            layer_num = idx + 1
+            configs[layer_num] = widget.get_config()
+            status = " (•)" if configs[layer_num].enabled else ""
+            self.video_tab_widget.setTabText(idx, f"Layer {layer_num}{status}")
+
+        self.video_layout_preview.set_configs(configs)
+        self._update_video_preview_frames()
+        self._save_settings()
+
+    def _update_video_preview_frames(self):
+        if not hasattr(self, "video_layout_preview") or not hasattr(self, "video_layer_widgets"):
+            return
+
+        if not hasattr(self, "_video_frame_cache"):
+            self._video_frame_cache = {}
+
+        def get_cached_frame(path):
+            if not path or not os.path.exists(path):
+                return None
+            if path in self._video_frame_cache:
+                return self._video_frame_cache[path]
+            
+            lower_path = path.lower()
+            if any(lower_path.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".bmp", ".webp"]):
+                img = QImage(path)
+                if not img.isNull():
+                    self._video_frame_cache[path] = img
+                    return img
+            
+            # Asynchronous extraction for videos to prevent UI freezing
+            if path in self.running_extractions:
+                return None
+            
+            self.running_extractions.add(path)
+            task = FrameExtractTask(path)
+            task.signals.loaded.connect(self._on_frame_loaded)
+            self.frame_pool.start(task)
+            return None
+
+        # 1. Update background frame
+        bg_files = self.pick_vid_bg.selected_files()
+        bg_img = None
+        if bg_files:
+            bg_img = get_cached_frame(bg_files[0])
+        self.video_layout_preview.set_bg_image(bg_img)
+
+        # 2. Update each of the 5 layers
+        for idx, widget in enumerate(self.video_layer_widgets):
+            layer_num = idx + 1
+            cfg_obj = widget.get_config()
+            
+            layer_img = None
+            if cfg_obj.enabled:
+                src_idx = widget.cmb_source_type.currentIndex()
+                if src_idx == 0:  # Video nền (Background video)
+                    bg_files = self.pick_vid_bg.selected_files()
+                    if bg_files:
+                        layer_img = get_cached_frame(bg_files[0])
+                elif src_idx == 1:  # Theo danh sách chạy (Video nguồn)
+                    selected_ranges = self.vid_batch_table.selectedRanges()
+                    if selected_ranges:
+                        row = selected_ranges[0].topRow()
+                        if 0 <= row < len(self._pairs):
+                            batch_video_path = self._pairs[row].audio_path
+                            layer_img = get_cached_frame(batch_video_path)
+                else:  # File tĩnh (Static file)
+                    static_path = widget.edit_path.text().strip()
+                    if static_path:
+                        layer_img = get_cached_frame(static_path)
+            
+            self.video_layout_preview.set_layer_image(layer_num, layer_img)
+
+    def _on_frame_loaded(self, path: str, image: QImage):
+        if path in self.running_extractions:
+            self.running_extractions.remove(path)
+        if image and not image.isNull():
+            self._video_frame_cache[path] = image
+            self._update_video_preview_frames()
+
+    def _on_preview_layer_selected(self, index: int):
+        if 1 <= index <= 5:
+            self.video_tab_widget.setCurrentIndex(index - 1)
+
+    def _on_preview_layer_moved(self, index: int, t: int, b: int, l: int, r: int):
+        widget = self.video_layer_widgets[index - 1]
+        widget.spn_margin_t.blockSignals(True)
+        widget.spn_margin_t.setValue(t)
+        widget.spn_margin_t.blockSignals(False)
+
+        widget.spn_margin_b.blockSignals(True)
+        widget.spn_margin_b.setValue(b)
+        widget.spn_margin_b.blockSignals(False)
+
+        widget.spn_margin_l.blockSignals(True)
+        widget.spn_margin_l.setValue(l)
+        widget.spn_margin_l.blockSignals(False)
+
+        widget.spn_margin_r.blockSignals(True)
+        widget.spn_margin_r.setValue(r)
+        widget.spn_margin_r.blockSignals(False)
+
+        self._on_video_layer_changed()
+
+    def _on_preview_layer_resized(self, index: int, scale_pct: int):
+        widget = self.video_layer_widgets[index - 1]
+        widget.spn_size.blockSignals(True)
+        widget.spn_size.setValue(scale_pct)
+        widget.spn_size.blockSignals(False)
+
+        self._on_video_layer_changed()
+
+    def _on_preview_layer_cropped(self, index: int, t: int, b: int, l: int, r: int):
+        widget = self.video_layer_widgets[index - 1]
+        widget.spn_crop_t.blockSignals(True)
+        widget.spn_crop_t.setValue(t)
+        widget.spn_crop_t.blockSignals(False)
+
+        widget.spn_crop_b.blockSignals(True)
+        widget.spn_crop_b.setValue(b)
+        widget.spn_crop_b.blockSignals(False)
+
+        widget.spn_crop_l.blockSignals(True)
+        widget.spn_crop_l.setValue(l)
+        widget.spn_crop_l.blockSignals(False)
+
+        widget.spn_crop_r.blockSignals(True)
+        widget.spn_crop_r.setValue(r)
+        widget.spn_crop_r.blockSignals(False)
+
+        self._on_video_layer_changed()
+
+    def _toggle_video_crop_mode(self, enabled: bool):
+        self.video_layout_preview.set_crop_mode(enabled)
+        if enabled:
+            self.btn_vid_crop_mode.setText("✓  Đang Crop (Tắt)")
+        else:
+            self.btn_vid_crop_mode.setText("✂  Bật Crop Mode")
+
+    def _pair_select_all(self):
+        for row in range(self.pair_table.rowCount()):
+            item = self.pair_table.item(row, 0)
+            if item and item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                item.setCheckState(Qt.CheckState.Checked)
+
+    def _pair_deselect_all(self):
+        for row in range(self.pair_table.rowCount()):
+            item = self.pair_table.item(row, 0)
+            if item and item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                item.setCheckState(Qt.CheckState.Unchecked)
+
+    def _vid_select_all(self):
+        for row in range(self.vid_batch_table.rowCount()):
+            item = self.vid_batch_table.item(row, 0)
+            if item and item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                item.setCheckState(Qt.CheckState.Checked)
+
+    def _vid_deselect_all(self):
+        for row in range(self.vid_batch_table.rowCount()):
+            item = self.vid_batch_table.item(row, 0)
+            if item and item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                item.setCheckState(Qt.CheckState.Unchecked)
+
+    def _on_table_item_changed(self, item):
+        if item.column() != 0:
+            return
+        table = self.sender()
+        if not table:
+            return
+        table.blockSignals(True)
+        try:
+            selected_ranges = table.selectedRanges()
+            if selected_ranges:
+                state = item.checkState()
+                clicked_row = item.row()
+                
+                # Check if clicked row is part of the selected ranges
+                in_selection = False
+                for r in selected_ranges:
+                    if r.topRow() <= clicked_row <= r.bottomRow():
+                        in_selection = True
+                        break
+                        
+                if in_selection:
+                    for r in selected_ranges:
+                        for row in range(r.topRow(), r.bottomRow() + 1):
+                            idx_item = table.item(row, 0)
+                            if idx_item and idx_item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                                idx_item.setCheckState(state)
+        finally:
+            table.blockSignals(False)
+
     def closeEvent(self, event):
         self._save_settings()
+        self.frame_pool.clear()
         if self._worker and self._worker.isRunning():
             self._worker.abort()
             self._worker.wait(3000)

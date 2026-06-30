@@ -67,7 +67,9 @@ class RenderWorker(QThread):
                 self._wait_if_paused()
                 if self._abort:
                     raise InterruptedError("Render đã bị dừng")
-                self.progress.emit(_base + pct * _scale, msg)
+                # Show current video percentage directly so progress bar updates continuously
+                msg_with_batch = msg.replace(f"[{pair.index}]", f"[{pair.index}/{total}]")
+                self.progress.emit(pct, msg_with_batch)
 
             def _log(line):
                 self.log_line.emit(line)

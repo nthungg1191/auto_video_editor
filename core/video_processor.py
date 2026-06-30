@@ -104,6 +104,11 @@ class ImageLayerConfig:
     margin_b: int = 20
     margin_l: int = 20
     margin_r: int = 20
+    crop_t: int = 0
+    crop_b: int = 0
+    crop_l: int = 0
+    crop_r: int = 0
+    radius: int = 0
 
 @dataclass
 class RenderConfig:
@@ -152,6 +157,29 @@ def probe_duration(file_path: str) -> float:
         return float(data["format"]["duration"])
     except Exception as e:
         raise RuntimeError(f"ffprobe failed on {file_path}: {e}")
+
+def probe_resolution(file_path: str) -> tuple[int, int]:
+    cmd = [
+        FFPROBE_PATH, "-v", "quiet",
+        "-print_format", "json",
+        "-show_streams",
+        "-select_streams", "v:0",
+        file_path
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=30)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffprobe returned non-zero code {result.returncode}. Stderr: {result.stderr}")
+        if not result.stdout.strip():
+            raise RuntimeError("ffprobe output is empty")
+        data = json.loads(result.stdout)
+        if "streams" in data and len(data["streams"]) > 0:
+            w = int(data["streams"][0]["width"])
+            h = int(data["streams"][0]["height"])
+            return w, h
+        raise ValueError("No video/image stream found")
+    except Exception as e:
+        return 1280, 720
 
 
 def list_video_files(folder: str) -> list[str]:
@@ -247,6 +275,8 @@ def select_bg_segment(
 # ---------------------------------------------------------------------------
 
 def _build_subtitle_filter(srt_path: str, style: SubtitleStyle) -> str:
+    if not srt_path or not os.path.exists(srt_path):
+        return ""
     """
     Build FFmpeg subtitles filter with force_style.
 
@@ -330,16 +360,26 @@ def build_ffmpeg_cmd(
 
     sub_filter = _build_subtitle_filter(srt_path, config.subtitle_style)
 
-    # Resolve active layers (supporting up to 3 layers)
+    # Resolve active layers (supporting up to 5 layers)
     active_layers = []
     if hasattr(config, "layers") and config.layers:
         for layer in config.layers:
-            if layer.enabled and layer.path and os.path.exists(layer.path):
-                active_layers.append(layer)
-                
+            if layer.enabled and layer.path:
+                # Resolve source type path dynamically
+                if layer.path == "Video nền":
+                    layer_resolved_path = bg_video
+                elif layer.path == "Theo danh sách chạy":
+                    layer_resolved_path = audio_path
+                else:
+                    layer_resolved_path = layer.path
+                    
+                if layer_resolved_path and os.path.exists(layer_resolved_path):
+                    layer._resolved_path = layer_resolved_path
+                    active_layers.append(layer)
+                    
     # Fallback to legacy logo config if no active layers set
     if not active_layers and config.logo_path and os.path.exists(config.logo_path):
-        active_layers.append(ImageLayerConfig(
+        fallback_layer = ImageLayerConfig(
             enabled=True,
             path=config.logo_path,
             position=config.logo_position,
@@ -349,82 +389,162 @@ def build_ffmpeg_cmd(
             margin_b=20,
             margin_l=20,
             margin_r=20
-        ))
+        )
+        fallback_layer._resolved_path = config.logo_path
+        active_layers.append(fallback_layer)
 
+    vf_parts = []
     if config.use_gpu:
         vcodec = config.codec
-
-        vf = (
-            f"hwdownload,format=nv12,format=yuv420p,"
-            f"setpts={pts_expr},"
-            f"scale={w}:{h}:flags=lanczos:force_original_aspect_ratio=decrease,"
-            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,"
-            f"{sub_filter}"
-        )
-
-        cmd = [
-            FFMPEG_PATH, "-y",
-            "-hwaccel", "cuda",
-            "-hwaccel_output_format", "cuda",
-            "-ss", f"{bg_start:.3f}",
-            "-t", f"{bg_segment_duration:.3f}",
-            "-i", bg_video,
-            "-i", audio_path,
-        ]
-        for layer in active_layers:
-            cmd.extend(["-i", layer.path])
-
-        quality_flags = ["-qp", "23"]
-        preset_flags  = ["-preset", "fast"]
-
+        vf_parts.extend([
+            "hwdownload",
+            "format=nv12",
+            "format=yuv420p",
+            f"setpts={pts_expr}",
+            f"scale={w}:{h}:flags=lanczos:force_original_aspect_ratio=decrease",
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"
+        ])
     else:
         vcodec = "libx265" if "hevc" in config.codec else "libx264"
+        vf_parts.extend([
+            f"setpts={pts_expr}",
+            f"scale={w}:{h}:flags=lanczos:force_original_aspect_ratio=decrease",
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"
+        ])
 
-        vf = (
-            f"setpts={pts_expr},"
-            f"scale={w}:{h}:flags=lanczos:force_original_aspect_ratio=decrease,"
-            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,"
-            f"{sub_filter}"
-        )
+    if sub_filter:
+        vf_parts.append(sub_filter)
 
-        cmd = [
-            FFMPEG_PATH, "-y",
-            "-ss", f"{bg_start:.3f}",
-            "-t", f"{bg_segment_duration:.3f}",
-            "-i", bg_video,
-            "-i", audio_path,
-        ]
-        for layer in active_layers:
-            cmd.extend(["-i", layer.path])
+    vf = ",".join(vf_parts)
 
-        quality_flags = ["-crf", "23"]
-        preset_flags  = ["-preset", "fast"]
+    cmd = [
+        FFMPEG_PATH, "-y",
+    ]
+    if config.use_gpu:
+        cmd.extend([
+            "-hwaccel", "cuda",
+            "-hwaccel_output_format", "cuda",
+        ])
+        
+    cmd.extend([
+        "-ss", f"{bg_start:.3f}",
+        "-t", f"{bg_segment_duration:.3f}",
+        "-i", bg_video,
+        "-i", audio_path,
+    ])
+    for layer in active_layers:
+        cmd.extend(["-i", layer._resolved_path])
+
+    quality_flags = ["-qp", "23"] if config.use_gpu else ["-crf", "23"]
+    preset_flags  = ["-preset", "fast"]
 
     # Build filter complex for sequential overlays
     filter_parts = [f"[0:v]{vf}[v_base]"]
     current_base = "v_base"
 
+    is_edit_sub = bool(config.srt_folder)
+
     for idx, layer in enumerate(active_layers):
         input_index = 2 + idx
         layer_output = f"v_layer_{idx}"
         
-        # 1. Scale & Opacity filter for this layer
-        filter_parts.append(
-            f"[{input_index}:v]scale={layer.size}:-1,format=rgba,"
-            f"colorchannelmixer=aa={layer.opacity:.2f}[{layer_output}]"
-        )
+        # 1. Probe original resolution of the layer clip
+        lw_orig, lh_orig = probe_resolution(layer._resolved_path)
         
-        # 2. Position calculations with margins
-        if layer.position == 0:  # Bottom-Right
-            overlay_pos = f"x=W-w-{layer.margin_r}:y=H-h-{layer.margin_b}"
-        elif layer.position == 1:  # Bottom-Left
-            overlay_pos = f"x={layer.margin_l}:y=H-h-{layer.margin_b}"
-        elif layer.position == 2:  # Top-Right
-            overlay_pos = f"x=W-w-{layer.margin_r}:y={layer.margin_t}"
-        elif layer.position == 3:  # Top-Left
-            overlay_pos = f"x={layer.margin_l}:y={layer.margin_t}"
-        else:  # 4: Top-Center
-            overlay_pos = f"x=(W-w)/2:y={layer.margin_t}"
+        if is_edit_sub:
+            # Edit Subtitles tab logo layer calculations (1280x720 canvas)
+            scale_x = int(w) / 1280.0
+            scale_y = int(h) / 720.0
+            
+            pixel_w = int(layer.size * scale_x)
+            pixel_w = max(4, (pixel_w // 2) * 2)
+            
+            crop_filter = ""
+            
+            filter_parts.append(
+                f"[{input_index}:v]{crop_filter}scale={pixel_w}:-2,format=rgba,"
+                f"colorchannelmixer=aa={layer.opacity:.2f}[{layer_output}]"
+            )
+            
+            ml = int(layer.margin_l * scale_x)
+            mr = int(layer.margin_r * scale_x)
+            mt = int(layer.margin_t * scale_y)
+            mb = int(layer.margin_b * scale_y)
+            
+            # Position mapping for Edit Sub:
+            # 0: BR, 1: BL, 2: TR, 3: TL, 4: Top-Center
+            if layer.position == 0:  # Bottom-Right
+                overlay_pos = f"x=W-w-{mr}:y=H-h-{mb}"
+            elif layer.position == 1:  # Bottom-Left
+                overlay_pos = f"x={ml}:y=H-h-{mb}"
+            elif layer.position == 2:  # Top-Right
+                overlay_pos = f"x=W-w-{mr}:y={mt}"
+            elif layer.position == 3:  # Top-Left
+                overlay_pos = f"x={ml}:y={mt}"
+            else:  # 4: Top-Center
+                overlay_pos = f"x=(W-w)/2:y={mt}"
+        else:
+            # Edit Video tab active layer calculations (400x225 workspace)
+            # 2. Crop values (virtual margins relative to virtual uncropped layer size)
+            crop_t = getattr(layer, "crop_t", 0)
+            crop_b = getattr(layer, "crop_b", 0)
+            crop_l = getattr(layer, "crop_l", 0)
+            crop_r = getattr(layer, "crop_r", 0)
+
+            # 3. Compute virtual uncropped layer size
+            if layer.size <= 100:
+                max_w_virt = 400.0 * (layer.size / 100.0)
+                max_h_virt = 225.0 * (layer.size / 100.0)
+                scale_factor_virt = min(max_w_virt / float(lw_orig), max_h_virt / float(lh_orig))
+                layer_w_virt = lw_orig * scale_factor_virt
+                layer_h_virt = lh_orig * scale_factor_virt
+            else:
+                layer_w_virt = float(layer.size)
+                layer_h_virt = layer_w_virt * lh_orig / float(lw_orig)
+
+            # 4. Map virtual crop to actual pixel crop on the original video size
+            actual_crop_l = max(0, min(lw_orig - 10, int(lw_orig * (crop_l / float(layer_w_virt)))))
+            actual_crop_r = max(0, min(lw_orig - actual_crop_l - 10, int(lw_orig * (crop_r / float(layer_w_virt)))))
+            actual_crop_t = max(0, min(lh_orig - 10, int(lh_orig * (crop_t / float(layer_h_virt)))))
+            actual_crop_b = max(0, min(lh_orig - actual_crop_t - 10, int(lh_orig * (crop_b / float(layer_h_virt)))))
+
+            # 5. Crop filter block
+            crop_filter = ""
+            if actual_crop_t > 0 or actual_crop_b > 0 or actual_crop_l > 0 or actual_crop_r > 0:
+                crop_filter = f"crop=iw-{actual_crop_l}-{actual_crop_r}:ih-{actual_crop_t}-{actual_crop_b}:{actual_crop_l}:{actual_crop_t},"
+
+            # 6. Compute final scale width pixel_w relative to cropped virtual width
+            cropped_w_virt = max(10.0, layer_w_virt - crop_l - crop_r)
+            pixel_w = int(int(w) * (cropped_w_virt / 400.0))
+            # Ensure even width for FFmpeg compatibility
+            pixel_w = max(4, (pixel_w // 2) * 2)
+
+            # 7. Build filter for scaling, crop, format conversion
+            filter_parts.append(
+                f"[{input_index}:v]{crop_filter}scale={pixel_w}:-2,format=rgba,"
+                f"colorchannelmixer=aa={layer.opacity:.2f}[{layer_output}]"
+            )
+            
+            # 8. Position calculations with scaled margins
+            scale_x = int(w) / 400.0
+            scale_y = int(h) / 225.0
+            
+            ml = int(layer.margin_l * scale_x)
+            mr = int(layer.margin_r * scale_x)
+            mt = int(layer.margin_t * scale_y)
+            mb = int(layer.margin_b * scale_y)
+
+            # Combo positions: 4: Center, 0: BR, 1: BL, 2: TR, 3: TL
+            if layer.position == 4: # Center
+                overlay_pos = f"x=(W-w)/2+({ml}-{mr})/2:y=(H-h)/2+({mt}-{mb})/2"
+            elif layer.position == 0:  # Bottom-Right
+                overlay_pos = f"x=W-w-{mr}:y=H-h-{mb}"
+            elif layer.position == 1:  # Bottom-Left
+                overlay_pos = f"x={ml}:y=H-h-{mb}"
+            elif layer.position == 2:  # Top-Right
+                overlay_pos = f"x=W-w-{mr}:y={mt}"
+            else:  # 3: Top-Left
+                overlay_pos = f"x={ml}:y={mt}"
             
         next_base = f"v_base_next_{idx}" if idx < len(active_layers) - 1 else "vout"
         filter_parts.append(f"[{current_base}][{layer_output}]overlay={overlay_pos}[{next_base}]")
@@ -479,14 +599,21 @@ def render_pair(
     audio_duration = probe_duration(pair.audio_path)
     _log(f"Audio duration: {audio_duration:.2f}s")
 
-    _progress(5, f"[{pair.index}] Chọn video nền ngẫu nhiên...")
-    bg_video, bg_start, bg_seg_dur, slow_pct = select_bg_segment(
-        config.bg_folder,
-        audio_duration,
-        config.slow_min,
-        config.slow_max,
-        config.bg_videos,
-    )
+    if not config.bg_folder and not config.bg_videos:
+        bg_video = pair.audio_path
+        bg_start = 0.0
+        bg_seg_dur = audio_duration
+        slow_pct = 100.0
+        _log("Không chọn video nền riêng; sử dụng trực tiếp video nguồn làm nền.")
+    else:
+        _progress(5, f"[{pair.index}] Chọn video nền ngẫu nhiên...")
+        bg_video, bg_start, bg_seg_dur, slow_pct = select_bg_segment(
+            config.bg_folder,
+            audio_duration,
+            config.slow_min,
+            config.slow_max,
+            config.bg_videos,
+        )
     _log(f"Background: {os.path.basename(bg_video)}")
     _log(f"Segment start: {bg_start:.1f}s, duration: {bg_seg_dur:.1f}s, slow: {slow_pct:.1f}%")
 
@@ -494,16 +621,24 @@ def render_pair(
     output_filename = f"{audio_stem}.mp4"
     output_path = os.path.join(config.output_folder, output_filename)
 
-    _progress(10, f"[{pair.index}] Chuẩn bị tệp phụ đề tạm thời...")
-    import shutil
+    temp_srt_path = ""
+    if pair.srt_path and os.path.exists(pair.srt_path):
+        _progress(10, f"[{pair.index}] Chuẩn bị tệp phụ đề tạm thời...")
+        import shutil
 
-    project_root = Path(__file__).resolve().parent.parent
-    temp_dir = project_root / ".temp_srt"
-    temp_dir.mkdir(exist_ok=True)
-    temp_srt_path = str(temp_dir / f"temp_{pair.index}.srt")
+        project_root = Path(__file__).resolve().parent.parent
+        temp_dir = project_root / ".temp_srt"
+        temp_dir.mkdir(exist_ok=True)
+        temp_srt_path = str(temp_dir / f"temp_{pair.index}.srt")
+        try:
+            shutil.copy2(pair.srt_path, temp_srt_path)
+        except Exception as e:
+            _log(f"Warning: Failed to copy srt file: {e}")
+            temp_srt_path = ""
+    else:
+        _progress(10, f"[{pair.index}] Bỏ qua phụ đề (không có srt)...")
+
     try:
-        shutil.copy2(pair.srt_path, temp_srt_path)
-
         _progress(12, f"[{pair.index}] Bắt đầu render với FFmpeg...")
 
         cmd = build_ffmpeg_cmd(
@@ -538,13 +673,19 @@ def _run_ffmpeg(cmd: list[str], total_duration: float,
                 progress_cb, log_cb, label: str, should_abort=None):
     time_pattern = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
 
+    import sys
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = 0x00004000  # BELOW_NORMAL_PRIORITY_CLASS
+
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         encoding="utf-8",
         errors="replace",
-        bufsize=1
+        bufsize=1,
+        creationflags=creationflags
     )
 
     for line in process.stdout:

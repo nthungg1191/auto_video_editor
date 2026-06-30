@@ -15,3 +15,5 @@ __pycache__/
 *.pyd
 
 /output
+/temp_srt
+.temp_srt/temp_1.srt
